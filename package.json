@@ -1,0 +1,14 @@
+{
+  "name": "omorfia-biems-server",
+  "version": "1.0.0",
+  "description": "Omorfia BIEMS -- Branch Intelligence & Expansion Management System (shared-server build)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

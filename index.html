@@ -2894,6 +2894,20 @@ const FORM_TABS = {
 
 const STORAGE_KEY = 'biems_overlay_v1';
 
+// v9.86 -- Shared-server sync build. When this file is served by the
+// companion server.js (see the repo README -- a tiny Node backend that
+// mirrors this same overlay to a shared data/db.json instead of each
+// browser's own localStorage), fetch('api/overlay') below succeeds and
+// every added/edited location becomes visible to everyone who opens the
+// link. If there is no server behind this page (e.g. it's opened as a
+// bare static file, or the server is temporarily unreachable), the fetch
+// fails immediately, serverSyncEnabled flips to false, and the app falls
+// back to the original browser-local-only behavior -- nothing breaks
+// either way, it just stops sharing.
+let serverSyncEnabled = true;
+let serverVersion = 0;
+let syncStatus = 'connecting'; // 'connecting' | 'synced' | 'saving' | 'offline'
+
 const DataStore = (function(){
   const OVERLAY_DEFAULTS = {overrides:{}, additions:[], archived:{}, competitors:{}, stations:{}, households:{}, documents:{}, financials:{}, fiveYear:{}, leaseRent:{}, staff:{}, salesForecast:{}, ageDist:{}, siteEvalDetail:{}, manualOwnNetwork:{}, savedFeasibilityChecks:[], recommendationCenters:{}, siteVisits:{}, leadProgress:{}, demographicsSource:{}, areaDemoConflicts:{}, demographicsOverwriteLog:{}, siteEvalCategoryRemarks:{}};
   function loadOverlay(){
@@ -2938,15 +2952,87 @@ const DataStore = (function(){
     // ownNetworkGradingCache below) any time the data layer is written to,
     // so a stale grading is never served after a save/import/archive.
     ownNetworkGradingCache = null;
-    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(ov)); return true; }
+    let localOk = true;
+    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(ov)); }
     catch(e){
+      localOk = false;
       console.warn('BIEMS: could not persist to localStorage', e);
       if(!saveWarned){
         saveWarned = true;
         alert('This save could not be stored — the browser\'s local storage is full (this is common once several documents/photos have been attached). Earlier saves are safe, but this last change was NOT persisted. Consider removing an older document to free up space, or exporting your data before continuing.');
       }
-      return false;
     }
+    // v9.86 -- mirror the same write to the shared server, if one is
+    // present (see the note above serverSyncEnabled). localStorage above
+    // remains the source of truth this browser can always read back from
+    // instantly and offline; this is purely an additional "also tell
+    // everyone else" write, fire-and-forget with a status badge so a
+    // failed sync is visible rather than silent.
+    if(serverSyncEnabled){
+      syncStatus = 'saving';
+      updateSyncBadge();
+      pushServerOverlay(ov).then(data=>{
+        serverVersion = data.version;
+        syncStatus = 'synced';
+        updateSyncBadge();
+      }).catch(e=>{
+        console.warn('BIEMS: could not save to the shared server (kept safely in this browser; will retry on the next change or refresh):', e.message);
+        syncStatus = 'offline';
+        updateSyncBadge();
+      });
+    }
+    return localOk;
+  }
+  async function fetchServerOverlay(){
+    const res = await fetch('api/overlay', {cache:'no-store'});
+    if(!res.ok) throw new Error('server responded ' + res.status);
+    return res.json(); // {version, overlay}
+  }
+  async function pushServerOverlay(ov){
+    const res = await fetch('api/overlay', {
+      method: 'PUT',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({overlay: ov})
+    });
+    if(!res.ok) throw new Error('server responded ' + res.status);
+    return res.json(); // {version}
+  }
+  // Called once, before the app's first render (see the DOMContentLoaded
+  // handler in the INIT section): replaces whatever loadOverlay() found in
+  // this browser's own localStorage with the shared server's current copy,
+  // so every visitor starts from the same data. Falls back to the local
+  // copy already loaded into `overlay` if the server can't be reached
+  // (offline, or this file opened without server.js running behind it).
+  async function bootstrapFromServer(){
+    try{
+      const data = await fetchServerOverlay();
+      overlay = Object.assign({}, OVERLAY_DEFAULTS, data.overlay || {});
+      serverVersion = data.version || 0;
+      ownNetworkGradingCache = null;
+      try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(overlay)); }catch(e){}
+      syncStatus = 'synced';
+    }catch(e){
+      console.warn('BIEMS: could not reach the shared server -- continuing with this browser\'s own local copy:', e.message);
+      serverSyncEnabled = false;
+      syncStatus = 'offline';
+    }
+    updateSyncBadge();
+  }
+  // Polled every few seconds (and on window focus) from the INIT section.
+  // Deliberately does NOT hot-swap the live `overlay` object or re-render
+  // mid-session -- someone could have a form open. Instead it just flags
+  // that newer data exists so the user can choose when to reload; see
+  // showUpdateBanner() in the INIT section.
+  function pollServer(){
+    if(!serverSyncEnabled) return;
+    fetchServerOverlay().then(data=>{
+      syncStatus = 'synced';
+      updateSyncBadge();
+      if(data.version > serverVersion) showUpdateBanner();
+    }).catch(e=>{
+      syncStatus = 'offline';
+      updateSyncBadge();
+    });
   }
   function saveOverlay(ov){
     if(batchDepth > 0){
@@ -3455,7 +3541,8 @@ const DataStore = (function(){
           getSavedFeasibilityChecks, addSavedFeasibilityCheck, removeSavedFeasibilityCheck,
           getRecommendationCenterOverride, setRecommendationCenterOverride, clearRecommendationCenterOverride,
           getDemographicsSource, setDemographicsSourceField, getAreaDemoConflicts, setAreaDemoConflictField,
-          getDemographicsOverwriteLog, appendDemographicsOverwriteLog, runBatched};
+          getDemographicsOverwriteLog, appendDemographicsOverwriteLog, runBatched,
+          bootstrapFromServer, pollServer};
 })();
 
 /* =========================================================================
@@ -3685,10 +3772,58 @@ function computeStaffSalesForecast(fiveYearRows, averageTicket){
 /* =========================================================================
    INIT
    ========================================================================= */
-window.addEventListener('DOMContentLoaded', ()=>{
+
+// v9.86 -- shared-server sync UI: a small fixed badge (bottom-right) shows
+// whether this session is talking to the shared server, and a dismissible
+// banner appears when someone else's edit lands on the server while this
+// page is open. Both are plain DOM, added once on first use, so they work
+// whether or not server.js is actually running behind this page.
+function updateSyncBadge(){
+  let el = document.getElementById('biemsSyncBadge');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'biemsSyncBadge';
+    el.style.cssText = 'position:fixed;right:10px;bottom:10px;z-index:9000;font:12px -apple-system,Segoe UI,Arial,sans-serif;padding:5px 10px;border-radius:14px;box-shadow:0 1px 4px rgba(0,0,0,.2);cursor:default;transition:background .2s,color .2s;';
+    document.body.appendChild(el);
+  }
+  const map = {
+    connecting: ['Connecting to shared data…', '#f1f3f4', '#5f6368'],
+    synced:     ['● Shared with everyone', '#e6f4ea', '#137333'],
+    saving:     ['Saving…', '#fef7e0', '#b06000'],
+    offline:    ['⚠ Not connected — saved to this browser only', '#fce8e6', '#c5221f'],
+  };
+  const [label, bg, fg] = map[syncStatus] || map.offline;
+  el.textContent = label;
+  el.style.background = bg;
+  el.style.color = fg;
+}
+let biemsUpdateBannerShown = false;
+function showUpdateBanner(){
+  if(biemsUpdateBannerShown) return;
+  biemsUpdateBannerShown = true;
+  const el = document.createElement('div');
+  el.id = 'biemsUpdateBanner';
+  el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9500;background:#1a73e8;color:#fff;font:13px -apple-system,Segoe UI,Arial,sans-serif;padding:8px 14px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.25);';
+  el.innerHTML = 'Someone else added or changed data since this page loaded. '
+    + '<button id="biemsReloadBtn" style="margin-left:10px;background:#fff;color:#1a73e8;border:none;border-radius:4px;padding:3px 10px;font-weight:600;cursor:pointer;">Reload to see it</button>'
+    + '<button id="biemsDismissBtn" style="margin-left:6px;background:transparent;color:#fff;border:1px solid rgba(255,255,255,.6);border-radius:4px;padding:3px 10px;cursor:pointer;">Later</button>';
+  document.body.appendChild(el);
+  document.getElementById('biemsReloadBtn').onclick = ()=> location.reload();
+  document.getElementById('biemsDismissBtn').onclick = ()=>{ el.remove(); biemsUpdateBannerShown = false; };
+}
+
+window.addEventListener('DOMContentLoaded', async ()=>{
   (async()=>{ try{ downloadsHandle = await claude.use('downloads'); }catch(e){ downloadsHandle = null; } })();
   const bs = document.getElementById('buildStamp');
   if(bs) bs.textContent = 'Build ' + BIEMS_BUILD;
+
+  // v9.86 -- must finish before anything below reads DataStore.all(): this
+  // replaces the local-only overlay with the shared server's current copy
+  // (or, if the server can't be reached, leaves the local copy in place
+  // and the app behaves exactly as the GitHub-Pages-only build did).
+  updateSyncBadge();
+  await DataStore.bootstrapFromServer();
+
   // v9.76 -- Task B: full-sweep demographics backfill, run on every load
   // (idempotent -- see reconcileAllAreaDemographics) so any demographic
   // value Melody has already entered (via the app's own edit form, in her
@@ -3719,6 +3854,13 @@ window.addEventListener('DOMContentLoaded', ()=>{
     if(!e.target.closest('#searchBox')) document.getElementById('searchResults').style.display='none';
     if(!e.target.closest('#fBrandMulti')) document.getElementById('brandDropdown').classList.remove('open');
   });
+
+  // v9.86 -- keep checking for other people's changes while this page
+  // stays open: every 8s, and immediately whenever the tab regains focus
+  // (the common case: someone switches back after a colleague says "I just
+  // added one").
+  setInterval(()=> DataStore.pollServer(), 8000);
+  window.addEventListener('focus', ()=> DataStore.pollServer());
 });
 
 
